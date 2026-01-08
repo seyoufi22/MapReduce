@@ -6,7 +6,8 @@
 #include <string.h>
 #include <pthread.h>
 
-#define MAX_SIZE 10
+#define MAX_SIZE 1000
+
 
 
 // Different function pointer types used by MR
@@ -15,11 +16,10 @@ typedef void (*Mapper)(char *file_name);
 typedef void (*Reducer)(char *key, Getter get_func, int partition_number);
 typedef unsigned long (*Partitioner)(char *key, int num_partitions);
 
-
 // Key/List struct and methods
 typedef struct{
 	char *key, **Valuelist;
-	int size, curIdx;
+	int size, curIdx, GetterIdx;
 } KeyListPair;
 
 
@@ -41,6 +41,7 @@ void initPartitions(int num_partitions){
 
 void initKeyListPair(int num_partition, int KeyIdx){
 	part[num_partition].Keylist[KeyIdx].curIdx = -1;
+	part[num_partition].Keylist[KeyIdx].GetterIdx = 0;
 	part[num_partition].Keylist[KeyIdx].size = MAX_SIZE;
 	part[num_partition].Keylist[KeyIdx].Valuelist = (char **)malloc(sizeof(char *) * part[num_partition].Keylist[KeyIdx].size);
 }
@@ -71,8 +72,8 @@ void push_back_NewKey(int num_partition, char *Key){
 	if (part[num_partition].CurIdx == part[num_partition].size - 1){
 		Increase_Partition_Key_List_Size(num_partition);
 	}
-
 	part[num_partition].Keylist[++part[num_partition].CurIdx].key = Key;
+	
 	initKeyListPair(num_partition, part[num_partition].CurIdx);
 }
 
@@ -85,38 +86,56 @@ void push_back_NewValue(int num_partition, int KeyIdx, char *value){
 	if (*CurValueListIdx == *CurValueListSize - 1){
 		Increase_Key_Value_List_Size(num_partition, KeyIdx);
 	}
-
+	
 	part[num_partition].Keylist[KeyIdx].Valuelist[++*CurValueListIdx] = value;	
 }
 
 // -----------------------------------------------------------------------------------------------
 
-// TBD
-// Partitions Key Sorting
-int compare(const void *a, const void *b) {
-    const KeyValuePair *pairA = (const KeyValuePair *)a;
-    const KeyValuePair *pairB = (const KeyValuePair *)b;
 
-    // Compare the Keys first
-    int keyCompare = strcmp(pairA->key, pairB->key);
+// Sorting
+int compareKey(const void *a, const void *b) {
+    const KeyListPair *pairA = (const KeyListPair *)a;
+    const KeyListPair *pairB = (const KeyListPair *)b;
 
-    // If keys are different, return the result immediately
-    if (keyCompare != 0) {
-        return keyCompare;
-    }
-
-    //If keys are equal, compare Values
-    return strcmp(pairA->value, pairB->value);
+	return strcmp(pairA->key, pairB->key);
 }
 
-void SortDynamicArray(dynamicArray *da){
-	qsort(da->list, da->CurIdx + 1, sizeof(KeyValuePair), compare);
+int compareValue(const void *a, const void *b) {
+    const char *valueA = (const char *)a;
+    const char *valueB = (const char *)b;
+
+	return strcmp(valueA, valueB);
 }
+void SortPartitionKeyList(int num_partition){
+	qsort(part[num_partition].Keylist, part[num_partition].CurIdx + 1, sizeof(KeyListPair), compareKey);
+}
+
+void SortValueList(int num_partition, int KeyIdx){
+	int size = part[num_partition].Keylist[KeyIdx].curIdx + 1;
+	qsort(part[num_partition].Keylist[KeyIdx].Valuelist, size, sizeof(char *), compareValue);
+}
+
 // --------------------------------------------------------------
 
 
 
 
+char *get_next(char *key, int partition_number) {
+    Partitions *p = &part[partition_number];
+    for (int i = 0; i <= p->CurIdx; i++) {
+        if (strcmp(p->Keylist[i].key, key) == 0) {
+            KeyListPair *pair = &p->Keylist[i];
+            if (pair->GetterIdx <= pair->curIdx) {
+                return pair->Valuelist[pair->GetterIdx++];
+            } else {
+                pair->GetterIdx = 0;  // Reset for potential future calls
+                return NULL;
+            }
+        }
+    }
+    return NULL;
+}
 
 
 // External functions: these are what you must define
@@ -129,11 +148,17 @@ unsigned long MR_DefaultHashPartition(char *key, int num_partitions){
 }
 
 void MR_Emit(char *key, char *value){
-	int num_partition = MR_DefaultHashPartition(key, num_partitions);
+
+	char *new_key = (char *)malloc(strlen(key) + 1);
+	strcpy(new_key, key);
+	char *new_value = (char *)malloc(strlen(value) + 1);
+	strcpy(new_value, value);
+
+	int num_partition = MR_DefaultHashPartition(new_key, num_partitions);
 
 	int Keyidx = -1;
 	for(int i = 0; i <= part[num_partition].CurIdx; i++){
-		if (strcmp(part[num_partition].Keylist[i].key, key) == 0){
+		if (strcmp(part[num_partition].Keylist[i].key, new_key) == 0){
 			Keyidx = i;
 			break;
 		}
@@ -141,10 +166,10 @@ void MR_Emit(char *key, char *value){
 
 	// Not Found the Key
 	if (Keyidx == -1){
-		push_back_NewKey(num_partition, key);
+		push_back_NewKey(num_partition, new_key);
 		Keyidx = part[num_partition].CurIdx;
 	}
-	push_back_NewValue(num_partition, Keyidx, value);
+	push_back_NewValue(num_partition, Keyidx, new_value);
 }
 
 
@@ -154,21 +179,34 @@ void MR_Run(int argc, char *argv[],
 	    Reducer reduce, int num_reducers, 
 	    Partitioner partition)
 {
-	if (argc < 2){
-		perror("Please enter input files\n");
+
+	//Process Map Phase
+	num_partitions = num_reducers;
+	part = (Partitions *)malloc(sizeof(Partitions) * num_partitions);
+	for(int i = 0; i < num_partitions; i++){
+		initPartitions(i);
+	}
+	for(int i = 1; i < argc; i++){
+		map(argv[i]);
 	}
 
+
+	//Intermediate Sorting Phase
+	for(int i = 0; i < num_partitions; i++){
+		SortPartitionKeyList(i);
+		for(int j = 0; j <= part[i].CurIdx; j++){
+			SortValueList(i, j);
+		}
+	}
+
+	//Process Reduce Phase
+	Getter get_func = &get_next;
+	for(int i = 0; i < num_partitions; i++){
+		for(int j = 0; j <= part[i].CurIdx; j++){
+			reduce(part[i].Keylist[j].key, get_func, i);
+		}
+	}
 	
-	// Process Map function
-
-
-	SortDynamicArray(da);
-	// Convert Key/Value to Key/List
-	int num_partitions = num_reducers;
-	KeyListPair *partitions[num_partitions];
-	for(int i = 0; i <= da->CurIdx; i++){
-		unsigned long num_partition = MR_DefaultHashPartition(da->list[i].key, num_partitions);
-	}
 }
 
 #endif // __mapreduce_h__
