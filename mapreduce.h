@@ -6,7 +6,7 @@
 #include <string.h>
 #include <pthread.h>
 
-#define MAX_SIZE 1000
+#define MAX_SIZE 10
 
 
 
@@ -27,16 +27,34 @@ typedef struct{
 typedef struct{
 	KeyListPair *Keylist;
 	int size, CurIdx;
+	pthread_mutex_t lock;
 } Partitions;
 
 // Global Variables
 int num_partitions;
 Partitions *part;
+Partitioner partition_func;
 
-void initPartitions(int num_partitions){
-	part->CurIdx = -1;
-	part->size = MAX_SIZE;
-	part->Keylist = (KeyListPair *)malloc(sizeof(KeyListPair) * part->size);
+// Thread pool structures
+typedef struct {
+    char **files;
+    int num_files;
+    int current_file;
+    pthread_mutex_t file_lock;
+    Mapper map_func;
+} MapperArgs;
+
+typedef struct {
+    int partition_id;
+    Reducer reduce_func;
+    Getter get_func;
+} ReducerArgs;
+
+void initPartitions(int num_partition){
+	part[num_partition].CurIdx = -1;
+	part[num_partition].size = MAX_SIZE;
+	part[num_partition].Keylist = (KeyListPair *)malloc(sizeof(KeyListPair) * part[num_partition].size);
+	pthread_mutex_init(&part[num_partition].lock, NULL);
 }
 
 void initKeyListPair(int num_partition, int KeyIdx){
@@ -102,11 +120,12 @@ int compareKey(const void *a, const void *b) {
 }
 
 int compareValue(const void *a, const void *b) {
-    const char *valueA = (const char *)a;
-    const char *valueB = (const char *)b;
+    const char *valueA = *(const char **)a;
+    const char *valueB = *(const char **)b;
 
 	return strcmp(valueA, valueB);
 }
+
 void SortPartitionKeyList(int num_partition){
 	qsort(part[num_partition].Keylist, part[num_partition].CurIdx + 1, sizeof(KeyListPair), compareKey);
 }
@@ -148,13 +167,14 @@ unsigned long MR_DefaultHashPartition(char *key, int num_partitions){
 }
 
 void MR_Emit(char *key, char *value){
-
 	char *new_key = (char *)malloc(strlen(key) + 1);
 	strcpy(new_key, key);
 	char *new_value = (char *)malloc(strlen(value) + 1);
 	strcpy(new_value, value);
 
-	int num_partition = MR_DefaultHashPartition(new_key, num_partitions);
+	int num_partition = partition_func(new_key, num_partitions);
+
+	pthread_mutex_lock(&part[num_partition].lock);
 
 	int Keyidx = -1;
 	for(int i = 0; i <= part[num_partition].CurIdx; i++){
@@ -168,10 +188,44 @@ void MR_Emit(char *key, char *value){
 	if (Keyidx == -1){
 		push_back_NewKey(num_partition, new_key);
 		Keyidx = part[num_partition].CurIdx;
+	} else {
+		free(new_key);  // Key already exists, free the duplicate
 	}
 	push_back_NewValue(num_partition, Keyidx, new_value);
+
+	pthread_mutex_unlock(&part[num_partition].lock);
 }
 
+// Mapper thread function
+void *mapper_thread(void *arg) {
+    MapperArgs *args = (MapperArgs *)arg;
+    
+    while (1) {
+        pthread_mutex_lock(&args->file_lock);
+        if (args->current_file >= args->num_files) {
+            pthread_mutex_unlock(&args->file_lock);
+            break;
+        }
+        char *file = args->files[args->current_file++];
+        pthread_mutex_unlock(&args->file_lock);
+        
+        args->map_func(file);
+    }
+    
+    return NULL;
+}
+
+// Reducer thread function
+void *reducer_thread(void *arg) {
+    ReducerArgs *args = (ReducerArgs *)arg;
+    int partition_id = args->partition_id;
+    
+    for (int j = 0; j <= part[partition_id].CurIdx; j++) {
+        args->reduce_func(part[partition_id].Keylist[j].key, args->get_func, partition_id);
+    }
+    
+    return NULL;
+}
 
 
 void MR_Run(int argc, char *argv[], 
@@ -179,6 +233,7 @@ void MR_Run(int argc, char *argv[],
 	    Reducer reduce, int num_reducers, 
 	    Partitioner partition)
 {
+	partition_func = partition;
 
 	//Process Map Phase
 	num_partitions = num_reducers;
@@ -186,10 +241,27 @@ void MR_Run(int argc, char *argv[],
 	for(int i = 0; i < num_partitions; i++){
 		initPartitions(i);
 	}
-	for(int i = 1; i < argc; i++){
-		map(argv[i]);
+
+	// Create mapper threads
+	pthread_t *mapper_threads = (pthread_t *)malloc(sizeof(pthread_t) * num_mappers);
+	MapperArgs mapper_args;
+	mapper_args.files = &argv[1];
+	mapper_args.num_files = argc - 1;
+	mapper_args.current_file = 0;
+	mapper_args.map_func = map;
+	pthread_mutex_init(&mapper_args.file_lock, NULL);
+
+	for (int i = 0; i < num_mappers; i++) {
+		pthread_create(&mapper_threads[i], NULL, mapper_thread, &mapper_args);
 	}
 
+	// Wait for all mapper threads to complete
+	for (int i = 0; i < num_mappers; i++) {
+		pthread_join(mapper_threads[i], NULL);
+	}
+
+	pthread_mutex_destroy(&mapper_args.file_lock);
+	free(mapper_threads);
 
 	//Intermediate Sorting Phase
 	for(int i = 0; i < num_partitions; i++){
@@ -201,11 +273,44 @@ void MR_Run(int argc, char *argv[],
 
 	//Process Reduce Phase
 	Getter get_func = &get_next;
-	for(int i = 0; i < num_partitions; i++){
-		for(int j = 0; j <= part[i].CurIdx; j++){
-			reduce(part[i].Keylist[j].key, get_func, i);
-		}
+	
+	pthread_t *reducer_threads = (pthread_t *)malloc(sizeof(pthread_t) * num_reducers);
+	ReducerArgs *reducer_args = (ReducerArgs *)malloc(sizeof(ReducerArgs) * num_reducers);
+
+	for (int i = 0; i < num_reducers; i++) {
+		reducer_args[i].partition_id = i;
+		reducer_args[i].reduce_func = reduce;
+		reducer_args[i].get_func = get_func;
+		pthread_create(&reducer_threads[i], NULL, reducer_thread, &reducer_args[i]);
 	}
+
+	// Wait for all reducer threads to complete
+	for (int i = 0; i < num_reducers; i++) {
+		pthread_join(reducer_threads[i], NULL);
+	}
+
+	free(reducer_threads);
+	free(reducer_args);
+
+	// Cleanup memory
+	for (int i = 0; i < num_partitions; i++) {
+		for (int j = 0; j <= part[i].CurIdx; j++) {
+			// Free all values in the value list
+			for (int k = 0; k <= part[i].Keylist[j].curIdx; k++) {
+				free(part[i].Keylist[j].Valuelist[k]);
+			}
+			// Free the value list array
+			free(part[i].Keylist[j].Valuelist);
+			// Free the key
+			free(part[i].Keylist[j].key);
+		}
+		// Free the key list array
+		free(part[i].Keylist);
+		// Destroy the mutex
+		pthread_mutex_destroy(&part[i].lock);
+	}
+	// Free the partitions array
+	free(part);
 	
 }
 
