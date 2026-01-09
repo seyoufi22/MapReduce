@@ -295,21 +295,15 @@ void MR_Run(int argc, char *argv[],
 	// Cleanup memory
 	for (int i = 0; i < num_partitions; i++) {
 		for (int j = 0; j <= part[i].CurIdx; j++) {
-			// Free all values in the value list
 			for (int k = 0; k <= part[i].Keylist[j].curIdx; k++) {
 				free(part[i].Keylist[j].Valuelist[k]);
 			}
-			// Free the value list array
 			free(part[i].Keylist[j].Valuelist);
-			// Free the key
 			free(part[i].Keylist[j].key);
 		}
-		// Free the key list array
 		free(part[i].Keylist);
-		// Destroy the mutex
 		pthread_mutex_destroy(&part[i].lock);
 	}
-	// Free the partitions array
 	free(part);
 	
 }
